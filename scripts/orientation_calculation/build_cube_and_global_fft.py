@@ -29,13 +29,16 @@ that loads `event_cube.npz` and visualizes per-frequency amplitude maps.
 """
 
 # ===== USER PARAMETERS =====
-EVENT_FILE = "./datasets/fan_const_rpm.raw"         # or .dat
+EVENT_FILE = "/u/63/bouzoud1/unix/git_repos/junction/datasets/drone_moving/drone_moving.dat"         # or .dat
 OUTPUT_CUBE = "event_cube.npz"       # intermediate storage
+
+F_MIN_HZ = 1000.0   # adjust to something comfortably below your propeller band
+
 
 # Time bin size in microseconds.
 # 2000 us = 2 ms -> max frequency ~ 1 / (2 * 2 ms) = 250 Hz (Nyquist)
 # Decrease for higher max frequency (at the cost of more memory).
-DELTA_T_US = 2000
+DELTA_T_US = 1000
 
 # Spatial binning factor. 8 means 8x8 sensor pixels are aggregated into
 # a single grid cell. Increase to reduce memory usage.
@@ -141,17 +144,10 @@ def build_event_cube(path,
     return cube, dt
 
 
-def analyze_global_frequency(cube, dt, top_k=5):
-    """Compute a global temporal spectrum by summing over space.
-
-    Args:
-        cube: Array of shape (T, H, W).
-        dt:   Sampling interval (seconds).
-        top_k: Number of strongest frequency peaks to print.
-
-    Returns:
-        freqs: Frequencies (Hz) corresponding to rFFT bins.
-        spec:  Complex spectrum values for the global time series.
+def analyze_global_frequency(cube, dt, top_k=5, f_min_hz=None):
+    """
+    Compute a global temporal spectrum by summing over space.
+    ...
     """
     # Global time series: sum over spatial dimensions
     s = cube.sum(axis=(1, 2)).astype(np.float64)
@@ -161,20 +157,33 @@ def analyze_global_frequency(cube, dt, top_k=5):
     spec = np.fft.rfft(s)
     mag = np.abs(spec)
 
-    # Ignore DC (index 0) when searching for peaks
-    if len(mag) > 1:
-        idx_sorted = np.argsort(mag[1:])[::-1] + 1
-        idx_sorted = idx_sorted[: min(top_k, len(idx_sorted))]
+    # Build mask: drop DC and, optionally, everything below f_min_hz
+    mask = np.ones_like(freqs, dtype=bool)
+    if freqs.size > 0:
+        mask[0] = False  # always ignore DC
+    if f_min_hz is not None:
+        mask &= freqs >= f_min_hz
 
-        print("Top global frequency peaks:")
+    if np.any(mask):
+        mag_masked = mag[mask]
+        freq_idx = np.where(mask)[0]
+
+        # Sort by magnitude within the masked band
+        idx_sorted_local = np.argsort(mag_masked)[::-1]
+        idx_sorted = freq_idx[idx_sorted_local[: min(top_k, len(idx_sorted_local))]]
+
+        print("Top global frequency peaks (>= "
+              f"{f_min_hz if f_min_hz is not None else 0:.1f} Hz):")
         for i in idx_sorted:
             print(f"  f ≈ {freqs[i]:.1f} Hz, magnitude = {mag[i]:.3g}")
     else:
-        print("Spectrum too short to analyze peaks.")
+        print("No frequencies in the selected range to analyze.")
 
-    # Plot spectrum
+    # Plot full spectrum for inspection
     plt.figure(figsize=(8, 4))
     plt.plot(freqs, mag)
+    if f_min_hz is not None:
+        plt.axvline(f_min_hz, linestyle="--")
     plt.xlabel("Frequency [Hz]")
     plt.ylabel("|FFT|")
     plt.title("Global spectrum from event cube")
@@ -185,25 +194,26 @@ def analyze_global_frequency(cube, dt, top_k=5):
     return freqs, spec
 
 
-def main():
-    if os.path.exists(OUTPUT_CUBE):
-        print(f"Loading existing cube from {OUTPUT_CUBE}")
-        data = np.load(OUTPUT_CUBE)
-        cube = data["cube"]
-        dt = float(data["dt"])
-    else:
-        cube, dt = build_event_cube(
-            EVENT_FILE,
-            DELTA_T_US,
-            GRID_DOWNSAMPLE,
-            ROI,
-            max_time_bins=MAX_TIME_BINS,
-            max_duration_s=MAX_DURATION_S,
-        )
-        np.savez_compressed(OUTPUT_CUBE, cube=cube.astype(np.float32), dt=dt)
-        print(f"Saved cube to {OUTPUT_CUBE}")
 
-    _freqs, _spec = analyze_global_frequency(cube, dt, top_k=TOP_K_PEAKS)
+def main():
+    # if os.path.exists(OUTPUT_CUBE):
+    #     print(f"Loading existing cube from {OUTPUT_CUBE}")
+    #     data = np.load(OUTPUT_CUBE)
+    #     cube = data["cube"]
+    #     dt = float(data["dt"])
+    # else:
+    cube, dt = build_event_cube(
+        EVENT_FILE,
+        DELTA_T_US,
+        GRID_DOWNSAMPLE,
+        ROI,
+        max_time_bins=MAX_TIME_BINS,
+        max_duration_s=MAX_DURATION_S,
+    )
+    np.savez_compressed(OUTPUT_CUBE, cube=cube.astype(np.float32), dt=dt)
+    print(f"Saved cube to {OUTPUT_CUBE}")
+
+    _freqs, _spec = analyze_global_frequency(cube, dt, top_k=TOP_K_PEAKS, f_min_hz=F_MIN_HZ)
 
 
 if __name__ == "__main__":

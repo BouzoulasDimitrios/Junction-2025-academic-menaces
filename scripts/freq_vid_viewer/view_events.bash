@@ -1,0 +1,1 @@
+python view_events.py ~/git_repos/junction/datasets/drone_moving/drone_moving.dat
