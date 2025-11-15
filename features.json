@@ -1,0 +1,48 @@
+{
+  "features": [
+    {
+      "id": "propeller-speed",
+      "name": "Propeller Speed Analysis",
+      "video_path": "videos/propeller-speed.mp4",
+      "visualizations": [
+        {
+          "id": "rpm-chart",
+          "type": "chart",
+          "image_path": "/static/visualizations/rpm-chart.png",
+          "title": "RPM Over Time"
+        }
+      ]
+    },
+    {
+      "id": "movement-prediction",
+      "name": "Movement Prediction",
+      "video_path": "videos/movement-prediction.mp4",
+      "visualizations": []
+    },
+    {
+      "id": "speed-prediction",
+      "name": "Speed Prediction",
+      "video_path": "videos/speed-prediction.mp4",
+      "visualizations": [
+        {
+          "id": "speed-graph",
+          "type": "graph",
+          "image_path": "/static/visualizations/speed-graph.png",
+          "title": "Predicted Speed"
+        }
+      ]
+    },
+    {
+      "id": "boundary-detection",
+      "name": "Boundary Detection",
+      "video_path": "videos/boundary-detection.mp4",
+      "visualizations": []
+    },
+    {
+      "id": "noise-removal",
+      "name": "Noise Removal",
+      "video_path": "videos/noise-removal.mp4",
+      "visualizations": []
+    }
+  ]
+}
