@@ -48,16 +48,19 @@ def denoise_frame(frame: np.ndarray) -> np.ndarray:
     return denoised_bgr
 
 
-def detect_drone_via_fft(frame: np.ndarray):
+def detect_drone_via_fft(frame: np.ndarray, top_k_spikes: int = 4):
     """
     Use a global 2D FFT on the denoised frame to detect:
     - Propeller regions -> red bounding boxes
     - Drone envelope (frequency-based) -> green bounding box (union of props)
+    Also compute the top-K magnitude spikes in the 2D FFT.
 
     Returns:
         annotated_frame: BGR image with drawn boxes
         prop_boxes: list of (x, y, w, h)
         freq_drone_box: (x, y, w, h) or None
+        top_spikes: list of dicts with keys:
+            {'fx': float, 'fy': float, 'mag': float, 'ky': int, 'kx': int}
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
@@ -76,7 +79,33 @@ def detect_drone_via_fft(frame: np.ndarray):
 
     f_hp = fshift * high_pass_mask
 
-    # Back to spatial domain
+    # ---- TOP SPIKES IN FREQUENCY DOMAIN ------------------------------------
+    # Use magnitude of original shifted FFT, but ignore low frequencies
+    mag = np.abs(fshift)
+    spike_mask = (dist > radius * 0.75).astype(np.float32)  # ignore center
+    mag_spike = mag * spike_mask
+
+    flat = mag_spike.ravel()
+    top_spikes = []
+    if flat.size > 0:
+        k = min(top_k_spikes, flat.size)
+        idx = np.argpartition(flat, -k)[-k:]
+        idx_sorted = idx[np.argsort(flat[idx])[::-1]]
+
+        for i in idx_sorted:
+            ky = int(i // w)
+            kx = int(i % w)
+            mval = float(mag[ky, kx])
+
+            # Map indices to normalized spatial frequencies in cycles/pixel
+            fx = (kx - cx) / float(w)  # approx -0.5 .. 0.5
+            fy = (ky - cy) / float(h)
+
+            top_spikes.append(
+                {"fx": fx, "fy": fy, "mag": mval, "kx": kx, "ky": ky}
+            )
+
+    # Back to spatial domain with high-pass content
     f_ishift = np.fft.ifftshift(f_hp)
     img_hp = np.fft.ifft2(f_ishift)
     img_hp = np.abs(img_hp)
@@ -157,7 +186,36 @@ def detect_drone_via_fft(frame: np.ndarray):
             cv2.LINE_AA,
         )
 
-    return annotated, prop_boxes, freq_drone_box
+    return annotated, prop_boxes, freq_drone_box, top_spikes
+
+
+def estimate_rpm_from_fft_spikes(top_spikes) -> float:
+    """
+    Heuristic: convert dominant spatial frequency spike into an RPM-like value.
+
+    - Uses radial spatial frequency of the strongest spike.
+    - Maps radial freq in [0, 0.5] (cycles/pixel) to [0, MAX_RPM] linearly.
+    - This is a *calibration point* you should tune with real data.
+
+    Returns:
+        rpm_estimate (float)
+    """
+    if not top_spikes:
+        return 0.0
+
+    # Use strongest spike
+    sp = top_spikes[0]
+    fx = sp["fx"]
+    fy = sp["fy"]
+
+    radial = float(np.hypot(fx, fy))  # 0..~0.7
+
+    MAX_RPM = 10000.0  # tune based on real rotor speeds
+    # assume radial=0.5 -> MAX_RPM
+    rpm = (radial / 0.5) * MAX_RPM
+    rpm = max(0.0, min(MAX_RPM, rpm))
+
+    return rpm
 
 
 def cluster_accumulated_box(
@@ -272,6 +330,11 @@ class BoxKalmanTracker:
 
     State: [cx, cy, vx, vy, w, h]^T
     Measurement: [cx, cy, w, h]^T
+
+    RPM-aware:
+    - RPM level & trend modulate process noise (expected motion).
+    - Low/flat RPM -> tracker tends to keep velocity near zero.
+    - High/increasing RPM -> tracker allows larger velocity changes.
     """
 
     def __init__(self):
@@ -279,15 +342,14 @@ class BoxKalmanTracker:
         self.initialized = False
         self.last_t = None
 
-        # Keep a short history of recent predicted states for
-        # more responsive velocity estimation
-        # entries: (t, cx, cy)
+        # Recent predicted centers for extra motion sensitivity (optional)
         self.recent_states: list[tuple[float, float, float]] = []
 
-        # Transition matrix (dt will be updated each step)
-        self.kf.transitionMatrix = np.eye(6, dtype=np.float32)
+        # RPM state
+        self.current_rpm: float | None = None
+        self.rpm_history: list[tuple[float, float]] = []  # (t, rpm)
 
-        # Measurement matrix
+        self.kf.transitionMatrix = np.eye(6, dtype=np.float32)
         self.kf.measurementMatrix = np.array(
             [
                 [1, 0, 0, 0, 0, 0],  # cx
@@ -298,18 +360,48 @@ class BoxKalmanTracker:
             dtype=np.float32,
         )
 
-        # Process noise (how much we trust the motion model)
-        self.kf.processNoiseCov = np.diag(
+        # Base process noise (will be modulated by RPM)
+        self.base_process_noise = np.diag(
             [1e-3, 1e-3, 1e-2, 1e-2, 1e-4, 1e-4]
         ).astype(np.float32)
+        self.kf.processNoiseCov = self.base_process_noise.copy()
 
-        # Measurement noise (how noisy detections are)
         self.kf.measurementNoiseCov = np.diag(
             [1e-1, 1e-1, 1e-1, 1e-1]
         ).astype(np.float32)
 
         self.kf.errorCovPost = np.eye(6, dtype=np.float32)
 
+    # -------- RPM interface -------------------------------------------------
+    def update_rpm(self, rpm: float, t: float):
+        """
+        Call this each frame BEFORE predict():
+
+        tracker.update_rpm(rpm_estimate, t_rec)
+        """
+        self.current_rpm = float(rpm)
+        self.rpm_history.append((t, self.current_rpm))
+        if len(self.rpm_history) > 20:
+            self.rpm_history = self.rpm_history[-20:]
+
+    def _rpm_stats(self):
+        """
+        Compute a simple RPM level and derivative (trend) from history.
+
+        Returns:
+            rpm_level: float   (current rpm or 0 if unknown)
+            rpm_deriv: float   (approx dRPM/dt, rpm per second)
+        """
+        if self.current_rpm is None or len(self.rpm_history) < 2:
+            return 0.0, 0.0
+
+        rpm_level = self.current_rpm
+        (t0, r0), (t1, r1) = self.rpm_history[-2], self.rpm_history[-1]
+        dt = max(1e-3, t1 - t0)
+        rpm_deriv = (r1 - r0) / dt
+        return rpm_level, rpm_deriv
+
+    # -------- Kalman core ---------------------------------------------------
     def init(self, bbox, t: float):
         x, y, w, h = bbox
         cx = x + w / 2.0
@@ -327,6 +419,48 @@ class BoxKalmanTracker:
         A[1, 3] = dt  # cy += vy * dt
         self.kf.transitionMatrix = A
 
+    def _update_process_noise_with_rpm(self):
+        """
+        Adjust processNoiseCov depending on RPM level and trend.
+
+        Intuition:
+        - When RPM low & not changing: small velocity noise => motion stays near zero.
+        - When RPM high or increasing rapidly: large velocity noise => motion can change quickly.
+        """
+        rpm_level, rpm_deriv = self._rpm_stats()
+
+        MAX_RPM = 10000.0  # should match mapping in estimate_rpm_from_fft_spikes
+        rpm_norm = np.clip(rpm_level / MAX_RPM, 0.0, 1.0)
+
+        RPM_DERIV_REF = 5000.0  # rpm/s considered "big change"
+        trend_norm = np.clip(rpm_deriv / RPM_DERIV_REF, -1.0, 1.0)
+
+        base_vel_scale = 0.2
+        k_level = 1.0
+        k_trend = 1.0
+
+        vel_scale = base_vel_scale + k_level * rpm_norm + k_trend * max(0.0, trend_norm)
+        vel_scale = float(np.clip(vel_scale, 0.1, 5.0))
+
+        Q = self.base_process_noise.copy()
+        # Scale velocity noise
+        Q[2, 2] *= vel_scale**2
+        Q[3, 3] *= vel_scale**2
+
+        # Slightly scale position noise with rpm to allow small moves at high RPM
+        pos_scale = 0.5 + 0.5 * rpm_norm  # 0.5–1.0
+        Q[0, 0] *= pos_scale**2
+        Q[1, 1] *= pos_scale**2
+
+        self.kf.processNoiseCov = Q
+
+        # If rpm is very low and trend small -> damp velocity
+        if rpm_level < 500.0 and abs(rpm_deriv) < 200.0:
+            state = self.kf.statePost
+            state[2, 0] *= 0.7  # vx
+            state[3, 0] *= 0.7  # vy
+            self.kf.statePost = state
+
     def predict(self, t: float):
         if not self.initialized:
             return None
@@ -337,12 +471,13 @@ class BoxKalmanTracker:
         self.last_t = t
 
         self._update_transition(dt)
+        self._update_process_noise_with_rpm()
+
         pred = self.kf.predict()
 
-        # Store recent predicted center for more responsive velocity
         cx, cy, vx, vy, w, h = pred.flatten()
         self.recent_states.append((t, float(cx), float(cy)))
-        if len(self.recent_states) > 10:  # keep last N predictions
+        if len(self.recent_states) > 10:
             self.recent_states = self.recent_states[-10:]
 
         return self._state_to_bbox(pred)
@@ -363,11 +498,7 @@ class BoxKalmanTracker:
 
     def predict_future(self, horizon_s: float, frame_shape):
         """
-        Predict bbox after `horizon_s` seconds.
-
-        NOW more sensitive to immediate changes:
-        - Prefer velocity estimated from the last two predicted states.
-        - Fall back to Kalman velocity if history is too short.
+        Optional future bbox prediction using current state + recent velocity.
         """
         if not self.initialized:
             return None
@@ -375,19 +506,16 @@ class BoxKalmanTracker:
         state = self.kf.statePost.flatten()
         cx, cy, vx_kf, vy_kf, w, h = state
 
-        # --- NEW: recent-velocity estimate from last two predictions ---
         if len(self.recent_states) >= 2:
             (t0, cx0, cy0), (t1, cx1, cy1) = self.recent_states[-2], self.recent_states[-1]
             dt = max(1e-3, t1 - t0)
             vx_recent = (cx1 - cx0) / dt
             vy_recent = (cy1 - cy0) / dt
 
-            # Blend recent velocity and Kalman velocity for stability
-            alpha = 0.7  # closer to 1.0 = more sensitive to recent motion
-            vx = alpha * vx_recent + (1.0 - alpha) * vx_kf
-            vy = alpha * vy_recent + (1.0 - alpha) * vy_kf
+            alpha_v = 0.7
+            vx = alpha_v * vx_recent + (1.0 - alpha_v) * vx_kf
+            vy = alpha_v * vy_recent + (1.0 - alpha_v) * vy_kf
         else:
-            # Not enough history, use Kalman velocity
             vx = vx_kf
             vy = vy_kf
 
@@ -411,9 +539,97 @@ class BoxKalmanTracker:
         return (x, y, int(round(w)), int(round(h)))
 
 
+def draw_future_gaussian_distribution(
+    tracker: BoxKalmanTracker,
+    frame: np.ndarray,
+    max_horizon: float = 2.0,
+    steps: int = 20,
+    alpha: float = 0.6,
+) -> np.ndarray:
+    """
+    Draw a Gaussian-like probability distribution of where the drone can be
+    from t=0s to t=max_horizon seconds into the future.
+    """
+    if not getattr(tracker, "initialized", False):
+        return frame
 
+    H, W, _ = frame.shape
+    heatmap = np.zeros((H, W), dtype=np.float32)
 
+    state = tracker.kf.statePost.flatten()
+    cx, cy, vx_kf, vy_kf, w, h = state
 
+    vx, vy = vx_kf, vy_kf
+    if hasattr(tracker, "recent_states") and len(tracker.recent_states) >= 2:
+        (t0, cx0, cy0), (t1, cx1, cy1) = tracker.recent_states[-2], tracker.recent_states[-1]
+        dt = max(1e-3, t1 - t0)
+        vx_recent = (cx1 - cx0) / dt
+        vy_recent = (cy1 - cy0) / dt
+        alpha_v = 0.7
+        vx = alpha_v * vx_recent + (1.0 - alpha_v) * vx_kf
+        vy = alpha_v * vy_recent + (1.0 - alpha_v) * vy_kf
+
+    times = np.linspace(0.0, max_horizon, steps)
+
+    base_sigma = max(w, h) * 0.25
+    sigma_growth = max(w, h) * 0.5 / max_horizon
+
+    for t in times:
+        cx_t = cx + vx * t
+        cy_t = cy + vy * t
+
+        sigma_t = base_sigma + sigma_growth * t
+        sigma_x = sigma_t
+        sigma_y = sigma_t
+
+        x_min = int(max(0, np.floor(cx_t - 3 * sigma_x)))
+        x_max = int(min(W - 1, np.ceil(cx_t + 3 * sigma_x)))
+        y_min = int(max(0, np.floor(cy_t - 3 * sigma_y)))
+        y_max = int(min(H - 1, np.ceil(cy_t + 3 * sigma_y)))
+
+        if x_max <= x_min or y_max <= y_min:
+            continue
+
+        xs = np.arange(x_min, x_max + 1, dtype=np.float32)
+        ys = np.arange(y_min, y_max + 1, dtype=np.float32)
+        X, Y = np.meshgrid(xs, ys)
+
+        g = np.exp(
+            -(((X - cx_t) ** 2) / (2 * sigma_x**2)
+              + ((Y - cy_t) ** 2) / (2 * sigma_y**2))
+        )
+
+        weight = 1.0 - (t / max_horizon) * 0.3
+        g *= weight
+
+        heatmap[y_min:y_max + 1, x_min:x_max + 1] += g.astype(np.float32)
+
+    if heatmap.max() > 0:
+        heatmap_norm = heatmap / heatmap.max()
+    else:
+        heatmap_norm = heatmap
+
+    heatmap_uint8 = (heatmap_norm * 255).astype(np.uint8)
+
+    color_map = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(color_map, alpha, frame, 1 - alpha, 0)
+
+    mask = heatmap_uint8 > 0
+    out = frame.copy()
+    out[mask] = overlay[mask]
+
+    cv2.putText(
+        out,
+        f"Gaussian future distribution (0–{max_horizon:.1f}s)",
+        (10, H - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    return out
 
 
 def draw_hud(
@@ -490,15 +706,17 @@ def main() -> None:
     tracker = BoxKalmanTracker()
     trajectory: list[tuple[float, float]] = []
 
-    # NEW: store propeller boxes for last N frames (for accumulation clustering)
     ACCUM_FRAMES = 5
     prop_history_frames: list[list[tuple[int, int, int, int]]] = []
 
     cv2.namedWindow(
-        "Evio Player (orig | denoised | accumulated-cluster-tracked)", cv2.WINDOW_NORMAL
+        "Evio Player (orig | denoised | Gaussian future + RPM)", cv2.WINDOW_NORMAL
     )
 
+    frame_idx = 0
+
     for batch_range in pacer.pace(src.ranges()):
+        frame_idx += 1
         window = get_window(
             src.event_words,
             src.order,
@@ -511,26 +729,43 @@ def main() -> None:
         draw_hud(frame, pacer, batch_range)
         draw_hud(denoised_frame, pacer, batch_range)
 
-        # FFT-based detection for THIS frame
-        detected_frame, prop_boxes, freq_box = detect_drone_via_fft(denoised_frame)
+        # --- FFT + spike analysis -----------------------------------------
+        t_fft_start = time.perf_counter()
+        detected_frame, prop_boxes, freq_box, top_spikes = detect_drone_via_fft(
+            denoised_frame, top_k_spikes=4
+        )
+        t_fft = (time.perf_counter() - t_fft_start) * 1000.0  # ms
 
-        # Update propeller history for accumulation
+        # Estimate RPM from FFT spikes
+        rpm_estimate = estimate_rpm_from_fft_spikes(top_spikes)
+
+        # Print spikes + RPM to console
+        if top_spikes:
+            print(f"\nFrame {frame_idx}: Top {len(top_spikes)} FFT spikes, RPM≈{rpm_estimate:.1f}")
+            for i, sp in enumerate(top_spikes):
+                print(
+                    f"  #{i+1}: fx={sp['fx']:+.4f}, fy={sp['fy']:+.4f}, "
+                    f"mag={sp['mag']:.2f}, idx=({sp['ky']},{sp['kx']})"
+                )
+
+        # Update propeller history
         if prop_boxes:
             prop_history_frames.append(prop_boxes)
             if len(prop_history_frames) > ACCUM_FRAMES:
                 prop_history_frames.pop(0)
 
-        # Flatten accumulated prop boxes from last N frames
         accumulated_boxes = [
             box for frame_boxes in prop_history_frames for box in frame_boxes
         ]
 
-        # Clustering based on accumulated boxes (multi-frame clustering)
+        # --- clustering + combination --------------------------------------
+        t_clust_start = time.perf_counter()
         cluster_box = cluster_accumulated_box(
             accumulated_boxes, detected_frame.shape
         )
+        combined_box = combine_boxes(freq_box, cluster_box, detected_frame.shape)
+        t_cluster = (time.perf_counter() - t_clust_start) * 1000.0  # ms
 
-        # Draw cluster box (magenta) – this is the *temporal* cluster
         if cluster_box is not None:
             x, y, bw, bh = cluster_box
             cv2.rectangle(detected_frame, (x, y), (x + bw, y + bh), (255, 0, 255), 2)
@@ -544,9 +779,6 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
-
-        # Combine per-frame FFT box with multi-frame cluster box
-        combined_box = combine_boxes(freq_box, cluster_box, detected_frame.shape)
 
         if combined_box is not None:
             x, y, bw, bh = combined_box
@@ -562,22 +794,26 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
-        # Time in seconds
         t_rec = batch_range.end_ts_us / 1e6
 
-        # Kalman tracking on combined box
+        # --- RPM-aware Kalman tracking -------------------------------------
+        t_track_start = time.perf_counter()
+
+        # Feed RPM into tracker before predicting
+        tracker.update_rpm(rpm_estimate, t_rec)
+
         if not tracker.initialized:
             if combined_box is not None:
                 tracker.init(combined_box, t_rec)
         else:
             tracker.predict(t_rec)
-            # Correct only when we have a combined detection
             if combined_box is not None:
                 tracker.correct(combined_box)
 
+        t_track = (time.perf_counter() - t_track_start) * 1000.0  # ms
+
         tracked_box = tracker.get_state_bbox()
 
-        # Draw tracked box (cyan)
         if tracked_box is not None:
             tx, ty, tw, th = tracked_box
             cv2.rectangle(
@@ -585,7 +821,7 @@ def main() -> None:
             )
             cv2.putText(
                 detected_frame,
-                "Drone (tracked KF)",
+                "Drone (tracked KF+RPM)",
                 (tx, max(0, ty - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -600,7 +836,7 @@ def main() -> None:
             if len(trajectory) > 500:
                 trajectory = trajectory[-500:]
 
-        # Draw trajectory (yellow)
+        # Trajectory
         if len(trajectory) >= 2:
             for i in range(1, len(trajectory)):
                 x1, y1 = trajectory[i - 1]
@@ -613,30 +849,72 @@ def main() -> None:
                     2,
                 )
 
-        # 2-second future prediction from tracker
-        future_box = tracker.predict_future(2.0, detected_frame.shape)
-        if future_box is not None:
-            px, py, pw, ph = future_box
-            cv2.rectangle(
-                detected_frame, (px, py), (px + pw, py + ph), (255, 0, 0), 2
-            )
-            cv2.putText(
-                detected_frame,
-                "Predicted (2s, KF)",
-                (px, max(0, py - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 0, 0),
-                2,
-                cv2.LINE_AA,
-            )
+        # Gaussian future
+        t_future_start = time.perf_counter()
+        detected_frame = draw_future_gaussian_distribution(
+            tracker,
+            detected_frame,
+            max_horizon=2.0,
+            steps=20,
+            alpha=0.6,
+        )
+        t_future = (time.perf_counter() - t_future_start) * 1000.0  # ms
+
+        # Print processing times + RPM
+        print(
+            f"Frame {frame_idx}: "
+            f"FFT={t_fft:.2f} ms, "
+            f"Cluster+Combine={t_cluster:.2f} ms, "
+            f"Track+RPM={t_track:.2f} ms, "
+            f"FutureGauss={t_future:.2f} ms, "
+            f"RPM≈{rpm_estimate:.1f}"
+        )
+
+        # Overlay timings and RPM
+        timing_str1 = (
+            f"FFT={t_fft:.1f}ms  Clust+Comb={t_cluster:.1f}ms"
+        )
+        timing_str2 = (
+            f"Track+RPM={t_track:.1f}ms  FutureGauss={t_future:.1f}ms"
+        )
+        cv2.putText(
+            detected_frame,
+            timing_str1,
+            (10, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            detected_frame,
+            timing_str2,
+            (10, 75),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            detected_frame,
+            f"RPM≈{rpm_estimate:.0f}",
+            (10, 95),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
 
         cv2.putText(
             detected_frame,
-            f"FFT(green), cluster_accum(magenta,{ACCUM_FRAMES}f), combined(orange), tracked(cyan)",
+            f"FFT(green), cluster_accum(magenta,{ACCUM_FRAMES}f), "
+            f"combined(orange), tracked(cyan,RPM-aware), future=Gaussian",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.48,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
@@ -644,7 +922,7 @@ def main() -> None:
 
         combined_view = np.hstack((frame, denoised_frame, detected_frame))
         cv2.imshow(
-            "Evio Player (orig | denoised | accumulated-cluster-tracked)", combined_view
+            "Evio Player (orig | denoised | Gaussian future + RPM)", combined_view
         )
 
         if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
@@ -655,4 +933,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
