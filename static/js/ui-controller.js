@@ -13,12 +13,19 @@ class UIController {
         }
         
         this.videoPlayer = videoPlayer;
+        this.datasets = [];
         this.features = [];
+        this.currentDataset = null;
         this.currentFeature = null;
         
         // Store DOM element references
+        this.datasetTogglesContainer = document.getElementById('dataset-toggles');
         this.featureTogglesContainer = document.getElementById('feature-toggles');
         this.playPauseButton = document.getElementById('play-pause-btn');
+        
+        if (!this.datasetTogglesContainer) {
+            console.error('Dataset toggles container not found');
+        }
         
         if (!this.featureTogglesContainer) {
             console.error('Feature toggles container not found');
@@ -75,25 +82,25 @@ class UIController {
             }
             
             const config = await response.json();
-            this.features = config.features || [];
+            this.datasets = this.normalizeDatasets(config);
             
-            if (this.features.length === 0) {
-                throw new Error('No features found in configuration');
+            if (this.datasets.length === 0) {
+                throw new Error('No datasets found in configuration');
             }
             
             // Hide loading indicator
             this.hideLoading();
             
-            // Render feature toggle buttons
-            this.renderFeatureToggles(this.features);
+            // Render dataset toggle buttons
+            this.renderDatasetToggles(this.datasets);
             
             // Set up play/pause button event listener
             if (this.playPauseButton) {
                 this.playPauseButton.addEventListener('click', this.handlePlayPause);
             }
             
-            // Load first feature by default
-            this.handleFeatureSwitch(this.features[0].id);
+            // Load first dataset/features by default
+            this.handleDatasetSwitch(this.datasets[0].id);
             
         } catch (error) {
             this.hideLoading();
@@ -125,6 +132,52 @@ class UIController {
     }
 
     /**
+     * Normalize configuration object into dataset collection
+     * @param {Object} config - Raw configuration response from backend
+     * @returns {Array} Array of dataset objects
+     */
+    normalizeDatasets(config) {
+        if (config && Array.isArray(config.datasets) && config.datasets.length > 0) {
+            return config.datasets;
+        }
+        
+        if (config && Array.isArray(config.features) && config.features.length > 0) {
+            return [{
+                id: 'default-dataset',
+                name: 'Available Features',
+                features: config.features
+            }];
+        }
+        
+        return [];
+    }
+
+    /**
+     * Render dataset toggle buttons
+     * @param {Array} datasets - Array of dataset configuration objects
+     */
+    renderDatasetToggles(datasets) {
+        if (!this.datasetTogglesContainer) {
+            return;
+        }
+        
+        this.datasetTogglesContainer.innerHTML = '';
+        
+        datasets.forEach(dataset => {
+            const button = document.createElement('button');
+            button.className = 'feature-toggle';
+            button.dataset.datasetId = dataset.id;
+            button.textContent = dataset.name;
+            
+            button.addEventListener('click', () => {
+                this.handleDatasetSwitch(dataset.id);
+            });
+            
+            this.datasetTogglesContainer.appendChild(button);
+        });
+    }
+
+    /**
      * Dynamically create toggle buttons for each feature
      * @param {Array} features - Array of feature configuration objects
      */
@@ -135,6 +188,14 @@ class UIController {
         
         // Clear existing toggles
         this.featureTogglesContainer.innerHTML = '';
+        
+        if (!features || features.length === 0) {
+            const emptyState = document.createElement('p');
+            emptyState.className = 'toggle-empty-state';
+            emptyState.textContent = 'No features available for this dataset.';
+            this.featureTogglesContainer.appendChild(emptyState);
+            return;
+        }
         
         // Create toggle button for each feature
         features.forEach(feature => {
@@ -150,6 +211,34 @@ class UIController {
             
             this.featureTogglesContainer.appendChild(button);
         });
+    }
+
+    /**
+     * Handle dataset toggle switch
+     * @param {string} datasetId - ID of the dataset to activate
+     */
+    handleDatasetSwitch(datasetId) {
+        const dataset = this.datasets.find(d => d.id === datasetId);
+        
+        if (!dataset) {
+            console.error(`Dataset not found: ${datasetId}`);
+            this.displayError(`Dataset "${datasetId}" not found.`, false);
+            return;
+        }
+        
+        this.currentDataset = dataset;
+        this.features = Array.isArray(dataset.features) ? dataset.features : [];
+        
+        this.updateActiveDatasetToggle(datasetId);
+        this.renderFeatureToggles(this.features);
+        
+        if (this.features.length > 0) {
+            this.handleFeatureSwitch(this.features[0].id);
+        } else {
+            this.currentFeature = null;
+            this.videoPlayer.pause();
+            this.displayError('No features available for the selected dataset.', false);
+        }
     }
 
     /**
@@ -189,7 +278,30 @@ class UIController {
     }
 
     /**
-     * Update active state of toggle buttons
+     * Update active state of dataset toggle buttons
+     * @param {string} activeDatasetId - ID of the selected dataset
+     */
+    updateActiveDatasetToggle(activeDatasetId) {
+        if (!this.datasetTogglesContainer) {
+            return;
+        }
+        
+        const allDatasetToggles = this.datasetTogglesContainer.querySelectorAll('.feature-toggle');
+        allDatasetToggles.forEach(toggle => {
+            toggle.classList.remove('active');
+        });
+        
+        const activeToggle = this.datasetTogglesContainer.querySelector(
+            `[data-dataset-id="${activeDatasetId}"]`
+        );
+        
+        if (activeToggle) {
+            activeToggle.classList.add('active');
+        }
+    }
+
+    /**
+     * Update active state of feature toggle buttons
      * @param {string} activeFeatureId - ID of the currently active feature
      */
     updateActiveToggle(activeFeatureId) {

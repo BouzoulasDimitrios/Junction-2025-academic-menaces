@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 import logging
 
-from config import load_config, FeatureConfig
+from config import load_config, DatasetConfig
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +35,7 @@ app.mount("/videos", StaticFiles(directory="videos"), name="videos")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Load configuration at startup
-config_cache: List[FeatureConfig] = []
+config_cache: List[DatasetConfig] = []
 
 
 @app.on_event("startup")
@@ -44,7 +44,9 @@ async def startup_event():
     global config_cache
     try:
         config_cache = load_config()
-        logger.info(f"Loaded {len(config_cache)} features from configuration")
+        dataset_count = len(config_cache)
+        feature_count = sum(len(dataset.features) for dataset in config_cache)
+        logger.info(f"Loaded {feature_count} features across {dataset_count} datasets from configuration")
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         # Don't fail startup, but log the error
@@ -115,26 +117,33 @@ async def get_config() -> JSONResponse:
                     }
                 )
         
-        # Convert FeatureConfig objects to dictionaries
-        features_data = []
-        for feature in config_cache:
-            feature_dict = {
-                "id": feature.id,
-                "name": feature.name,
-                "video_path": feature.video_path,
-                "visualizations": [
+        # Convert DatasetConfig objects to dictionaries
+        datasets_data: List[Dict[str, Any]] = []
+        for dataset in config_cache:
+            dataset_dict = {
+                "id": dataset.id,
+                "name": dataset.name,
+                "features": [
                     {
-                        "id": viz.id,
-                        "type": viz.type,
-                        "image_path": viz.image_path,
-                        "title": viz.title
+                        "id": feature.id,
+                        "name": feature.name,
+                        "video_path": feature.video_path,
+                        "visualizations": [
+                            {
+                                "id": viz.id,
+                                "type": viz.type,
+                                "image_path": viz.image_path,
+                                "title": viz.title
+                            }
+                            for viz in feature.visualizations
+                        ]
                     }
-                    for viz in feature.visualizations
+                    for feature in dataset.features
                 ]
             }
-            features_data.append(feature_dict)
+            datasets_data.append(dataset_dict)
         
-        return JSONResponse(content={"features": features_data})
+        return JSONResponse(content={"datasets": datasets_data})
     
     except HTTPException:
         # Re-raise HTTP exceptions

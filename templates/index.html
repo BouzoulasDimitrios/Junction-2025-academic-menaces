@@ -22,8 +22,19 @@
     <main class="container">
         <section class="feature-toggles-section">
             <h2 class="visually-hidden">Analysis Features</h2>
-            <div id="feature-toggles" class="feature-toggles">
-                <!-- Feature toggle buttons will be dynamically generated here -->
+            <div class="feature-toggles">
+                <div class="toggle-row" aria-label="Datasets">
+                    <p class="toggle-row-title">Datasets</p>
+                    <div id="dataset-toggles" class="toggle-row-buttons" aria-live="polite">
+                        <!-- Dataset toggle buttons will be dynamically generated here -->
+                    </div>
+                </div>
+                <div class="toggle-row" aria-label="Features">
+                    <p class="toggle-row-title">Features</p>
+                    <div id="feature-toggles" class="toggle-row-buttons" aria-live="polite">
+                        <!-- Feature toggle buttons will be dynamically generated here -->
+                    </div>
+                </div>
             </div>
         </section>
 
