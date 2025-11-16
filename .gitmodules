@@ -1,0 +1,3 @@
+[submodule "evio"]
+	path = evio
+	url = https://github.com/ahtihelminen/evio.git
