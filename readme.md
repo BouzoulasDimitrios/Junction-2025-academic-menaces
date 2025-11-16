@@ -8,6 +8,12 @@ Online Demo: [link](https://junction-2025-academic-menaces-bouzoulasdimitrios-pr
 
 </p>
 
+<p align="center">
+
+<img src="./readme_resources/drone_moving_advanced.gif" width = 80%> 
+
+</p>
+
 # Introduction
 
 We present 2 solutions that are capable of working together or independently with one being the **Basic** and the other being the **Advanced**
